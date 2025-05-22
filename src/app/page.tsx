@@ -33,12 +33,36 @@ export default function Home() {
   const fetchDiffs = async (page: number) => {
     setIsLoading(true);
     setError(null);
+    
+    // Add timeout for network requests
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s timeout
+    
     try {
       const response = await fetch(
-        `/api/sample-diffs?page=${page}&per_page=10`
+        `/api/sample-diffs?page=${page}&per_page=10`,
+        { 
+          signal: controller.signal,
+          headers: {
+            'Content-Type': 'application/json',
+          }
+        }
       );
+      
+      clearTimeout(timeoutId);
+      
       if (!response.ok) {
         let errorMsg = `HTTP error! status: ${response.status}`;
+        
+        // Handle specific HTTP status codes
+        if (response.status === 429) {
+          errorMsg = "Too many requests. Please wait a moment and try again.";
+        } else if (response.status >= 500) {
+          errorMsg = "Server error. Please try again later.";
+        } else if (response.status === 404) {
+          errorMsg = "API endpoint not found.";
+        }
+        
         try {
           const errorData = await response.json();
           errorMsg = errorData.error || errorData.details || errorMsg;
@@ -48,55 +72,178 @@ export default function Home() {
         }
         throw new Error(errorMsg);
       }
+      
+      // Validate response content type
+      const contentType = response.headers.get('content-type');
+      if (!contentType?.includes('application/json')) {
+        throw new Error('Invalid response format. Expected JSON.');
+      }
+      
       const data: ApiResponse = await response.json();
+      
+      // Validate response structure
+      if (!data || typeof data !== 'object') {
+        throw new Error('Invalid response data structure.');
+      }
+      
+      if (!Array.isArray(data.diffs)) {
+        throw new Error('Invalid diffs data. Expected an array.');
+      }
+      
+      // Validate individual diff items
+      const validDiffs = data.diffs.filter((diff: any) => 
+        diff && 
+        typeof diff.id === 'string' && 
+        typeof diff.description === 'string' && 
+        typeof diff.diff === 'string' && 
+        typeof diff.url === 'string'
+      );
+      
+      if (validDiffs.length !== data.diffs.length) {
+        console.warn(`Filtered out ${data.diffs.length - validDiffs.length} invalid diff items`);
+      }
 
       setDiffs((prevDiffs) =>
-        page === 1 ? data.diffs : [...prevDiffs, ...data.diffs]
+        page === 1 ? validDiffs : [...prevDiffs, ...validDiffs]
       );
-      setCurrentPage(data.currentPage);
-      setNextPage(data.nextPage);
+      setCurrentPage(data.currentPage || page);
+      setNextPage(data.nextPage || null);
       if (!initialFetchDone) setInitialFetchDone(true);
+      
     } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "An unknown error occurred"
-      );
+      clearTimeout(timeoutId);
+      
+      if (err instanceof Error) {
+        if (err.name === 'AbortError') {
+          setError("Request timed out. Please check your connection and try again.");
+        } else if (err.message.includes('Failed to fetch')) {
+          setError("Network error. Please check your internet connection.");
+        } else {
+          setError(err.message);
+        }
+      } else {
+        setError("An unexpected error occurred. Please try again.");
+      }
+      
+      console.error('Fetch diffs error:', err);
     } finally {
       setIsLoading(false);
     }
   };
 
   const generateNotes = async (pr: DiffItem) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout for AI generation
+    
     try {
       setLoadingPR(pr.id);
       setGeneratedNotes(prev => ({ ...prev, [pr.id]: "" }));
       setExpandedPRs(prev => ({ ...prev, [pr.id]: true }));
 
+      // Validate input data
+      if (!pr.description?.trim() || !pr.diff?.trim()) {
+        throw new Error("Invalid PR data: missing description or diff content");
+      }
+
       const res = await fetch("/api/generate-notes", {
         method: "POST",
-        body: JSON.stringify({ title: pr.description, diff: pr.diff }),
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          title: pr.description.trim(), 
+          diff: pr.diff.trim() 
+        }),
+        signal: controller.signal,
       });
 
-      if (!res.body) throw new Error("No stream received");
+      clearTimeout(timeoutId);
+
+      if (!res.ok) {
+        let errorMsg = `HTTP error! status: ${res.status}`;
+        
+        // Handle specific HTTP status codes
+        if (res.status === 429) {
+          errorMsg = "Too many requests. Please wait before generating more notes.";
+        } else if (res.status >= 500) {
+          errorMsg = "Server error while generating notes. Please try again.";
+        } else if (res.status === 413) {
+          errorMsg = "Diff content too large. Please try with a smaller diff.";
+        }
+        
+        try {
+          const errorData = await res.json();
+          errorMsg = errorData.error || errorData.message || errorMsg;
+        } catch {
+          // Response body might not be JSON for streaming endpoints
+        }
+        
+        throw new Error(errorMsg);
+      }
+
+      // Validate response has a body for streaming
+      if (!res.body) {
+        throw new Error("No response stream received from server");
+      }
+
+      // Check if the response is actually a stream
+      const contentType = res.headers.get('content-type');
+      if (!contentType?.includes('text/plain') && !contentType?.includes('application/octet-stream')) {
+        console.warn('Unexpected content type for streaming response:', contentType);
+      }
 
       const reader = res.body.getReader();
       const decoder = new TextDecoder("utf-8");
+      let accumulatedContent = "";
 
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value);
-        setGeneratedNotes(prev => ({
-          ...prev,
-          [pr.id]: prev[pr.id] + chunk
-        }));
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          
+          const chunk = decoder.decode(value, { stream: true });
+          accumulatedContent += chunk;
+          
+          setGeneratedNotes(prev => ({
+            ...prev,
+            [pr.id]: prev[pr.id] + chunk
+          }));
+        }
+      } catch (streamErr) {
+        console.error("Stream reading error:", streamErr);
+        throw new Error("Failed to read response stream");
+      } finally {
+        reader.releaseLock();
+      }
+
+      // Validate we received some content
+      if (!accumulatedContent.trim()) {
+        throw new Error("Received empty response from AI service");
       }
 
       setLoadingPR(null);
+      
     } catch (err) {
+      clearTimeout(timeoutId);
       console.error("Failed to generate notes", err);
+      
+      let errorMessage = "⚠️ Failed to generate notes. Please try again.";
+      
+      if (err instanceof Error) {
+        if (err.name === 'AbortError') {
+          errorMessage = "⏱️ Request timed out. The diff might be too large or the server is busy.";
+        } else if (err.message.includes('Failed to fetch')) {
+          errorMessage = "🌐 Network error. Please check your connection and try again.";
+        } else if (err.message.includes('Invalid PR data')) {
+          errorMessage = "⚠️ Invalid data. This PR might be missing content.";
+        } else if (err.message.length > 0) {
+          errorMessage = `⚠️ ${err.message}`;
+        }
+      }
+      
       setGeneratedNotes(prev => ({
         ...prev,
-        [pr.id]: "⚠️ Failed to generate notes. Please try again."
+        [pr.id]: errorMessage
       }));
       setLoadingPR(null);
     }
