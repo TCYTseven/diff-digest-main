@@ -1,6 +1,6 @@
 "use client"; // Mark as a Client Component
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import ReactMarkdown from 'react-markdown';
 
 // Define the expected structure of a diff object
@@ -19,6 +19,36 @@ interface ApiResponse {
   perPage: number;
 }
 
+// State persistence keys
+const STORAGE_KEYS = {
+  DIFFS: 'diff-digest-diffs',
+  GENERATED_NOTES: 'diff-digest-notes',
+  EXPANDED_PRS: 'diff-digest-expanded',
+  PAGINATION: 'diff-digest-pagination',
+  INTERRUPTED_STREAMS: 'diff-digest-interrupted-streams'
+} as const;
+
+// Helper functions for localStorage with error handling
+const saveToStorage = (key: string, data: any) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch (err) {
+    console.warn('Failed to save to localStorage:', err);
+  }
+};
+
+const loadFromStorage = <T extends any>(key: string, defaultValue: T): T => {
+  try {
+    const item = localStorage.getItem(key);
+    if (item) {
+      return JSON.parse(item) as T;
+    }
+  } catch (err) {
+    console.warn('Failed to load from localStorage:', err);
+  }
+  return defaultValue;
+};
+
 export default function Home() {
   const [diffs, setDiffs] = useState<DiffItem[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -29,6 +59,76 @@ export default function Home() {
   const [loadingPR, setLoadingPR] = useState<string | null>(null);
   const [generatedNotes, setGeneratedNotes] = useState<Record<string, string>>({});
   const [expandedPRs, setExpandedPRs] = useState<Record<string, boolean>>({});
+  const [interruptedStreams, setInterruptedStreams] = useState<Record<string, string>>({});
+  const [isHydrated, setIsHydrated] = useState<boolean>(false);
+
+  // Hydrate state from localStorage on mount
+  useEffect(() => {
+    // First set hydrated to true to match server/client initial state
+    setIsHydrated(true);
+    
+    // Then load from localStorage in the next tick to avoid hydration mismatch
+    const loadStoredData = () => {
+      if (typeof window !== 'undefined') {
+        const storedDiffs = loadFromStorage(STORAGE_KEYS.DIFFS, []);
+        const storedNotes = loadFromStorage(STORAGE_KEYS.GENERATED_NOTES, {});
+        const storedExpanded = loadFromStorage(STORAGE_KEYS.EXPANDED_PRS, {});
+        const storedInterrupted = loadFromStorage(STORAGE_KEYS.INTERRUPTED_STREAMS, {});
+        const pagination = loadFromStorage(STORAGE_KEYS.PAGINATION, { currentPage: 1, nextPage: null, initialFetchDone: false });
+        
+        // Only update if we actually have stored data to prevent unnecessary re-renders
+        if (storedDiffs.length > 0) setDiffs(storedDiffs);
+        if (Object.keys(storedNotes).length > 0) setGeneratedNotes(storedNotes);
+        if (Object.keys(storedExpanded).length > 0) setExpandedPRs(storedExpanded);
+        if (Object.keys(storedInterrupted).length > 0) setInterruptedStreams(storedInterrupted);
+        
+        if (pagination.currentPage !== 1 || pagination.nextPage !== null || pagination.initialFetchDone) {
+          setCurrentPage(pagination.currentPage);
+          setNextPage(pagination.nextPage);
+          setInitialFetchDone(pagination.initialFetchDone);
+        }
+      }
+    };
+    
+    // Use setTimeout to ensure this runs after hydration
+    const timeoutId = setTimeout(loadStoredData, 0);
+    return () => clearTimeout(timeoutId);
+  }, []);
+
+  // Save state to localStorage when it changes
+  useEffect(() => {
+    if (isHydrated) {
+      saveToStorage(STORAGE_KEYS.DIFFS, diffs);
+    }
+  }, [isHydrated, diffs]);
+
+  useEffect(() => {
+    if (isHydrated) {
+      saveToStorage(STORAGE_KEYS.GENERATED_NOTES, generatedNotes);
+    }
+  }, [isHydrated, generatedNotes]);
+
+  useEffect(() => {
+    if (isHydrated) {
+      saveToStorage(STORAGE_KEYS.EXPANDED_PRS, expandedPRs);
+    }
+  }, [isHydrated, expandedPRs]);
+
+  useEffect(() => {
+    if (isHydrated) {
+      saveToStorage(STORAGE_KEYS.PAGINATION, {
+        currentPage,
+        nextPage,
+        initialFetchDone
+      });
+    }
+  }, [isHydrated, currentPage, nextPage, initialFetchDone]);
+
+  useEffect(() => {
+    if (isHydrated) {
+      saveToStorage(STORAGE_KEYS.INTERRUPTED_STREAMS, interruptedStreams);
+    }
+  }, [isHydrated, interruptedStreams]);
 
   const fetchDiffs = async (page: number) => {
     setIsLoading(true);
@@ -131,14 +231,25 @@ export default function Home() {
     }
   };
 
-  const generateNotes = async (pr: DiffItem) => {
+  const generateNotes = async (pr: DiffItem, isResume: boolean = false) => {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s timeout for AI generation
     
     try {
       setLoadingPR(pr.id);
-      setGeneratedNotes(prev => ({ ...prev, [pr.id]: "" }));
+      
+      // If resuming, keep existing content; otherwise start fresh
+      if (!isResume) {
+        setGeneratedNotes(prev => ({ ...prev, [pr.id]: "" }));
+      }
       setExpandedPRs(prev => ({ ...prev, [pr.id]: true }));
+      
+      // Clear any interrupted stream markers
+      setInterruptedStreams(prev => {
+        const newState = { ...prev };
+        delete newState[pr.id];
+        return newState;
+      });
 
       // Validate input data
       if (!pr.description?.trim() || !pr.diff?.trim()) {
@@ -228,12 +339,15 @@ export default function Home() {
       console.error("Failed to generate notes", err);
       
       let errorMessage = "⚠️ Failed to generate notes. Please try again.";
+      let isInterrupted = false;
       
       if (err instanceof Error) {
         if (err.name === 'AbortError') {
           errorMessage = "⏱️ Request timed out. The diff might be too large or the server is busy.";
+          isInterrupted = true;
         } else if (err.message.includes('Failed to fetch')) {
           errorMessage = "🌐 Network error. Please check your connection and try again.";
+          isInterrupted = true;
         } else if (err.message.includes('Invalid PR data')) {
           errorMessage = "⚠️ Invalid data. This PR might be missing content.";
         } else if (err.message.length > 0) {
@@ -241,10 +355,21 @@ export default function Home() {
         }
       }
       
-      setGeneratedNotes(prev => ({
-        ...prev,
-        [pr.id]: errorMessage
-      }));
+      // If this was an interruption and we have partial content, mark it as resumable
+      const currentContent = generatedNotes[pr.id] || "";
+      if (isInterrupted && currentContent.trim()) {
+        setInterruptedStreams(prev => ({
+          ...prev,
+          [pr.id]: "Stream was interrupted. You can resume generation."
+        }));
+        // Don't overwrite existing content, just stop loading
+      } else {
+        setGeneratedNotes(prev => ({
+          ...prev,
+          [pr.id]: errorMessage
+        }));
+      }
+      
       setLoadingPR(null);
     }
   };
@@ -267,6 +392,29 @@ export default function Home() {
     }
   };
 
+  const clearStoredData = () => {
+    Object.values(STORAGE_KEYS).forEach(key => {
+      try {
+        localStorage.removeItem(key);
+      } catch (err) {
+        console.warn('Failed to clear localStorage item:', key, err);
+      }
+    });
+    
+    // Reset state
+    setDiffs([]);
+    setGeneratedNotes({});
+    setExpandedPRs({});
+    setInterruptedStreams({});
+    setCurrentPage(1);
+    setNextPage(null);
+    setInitialFetchDone(false);
+  };
+
+  const resumeGeneration = (pr: DiffItem) => {
+    generateNotes(pr, true);
+  };
+
   return (
     <>
       {/* Starfield Background */}
@@ -274,20 +422,30 @@ export default function Home() {
         <div className="absolute inset-0 bg-gradient-to-t from-slate-900 via-slate-800 to-black"></div>
         {/* Animated starfield */}
         <div className="absolute inset-0 opacity-60">
-          {[...Array(150)].map((_, i) => (
-            <div
-              key={i}
-              className="absolute bg-white rounded-full animate-pulse"
-              style={{
-                left: `${Math.random() * 100}%`,
-                top: `${Math.random() * 100}%`,
-                width: `${Math.random() * 3 + 1}px`,
-                height: `${Math.random() * 3 + 1}px`,
-                animationDelay: `${Math.random() * 3}s`,
-                animationDuration: `${Math.random() * 3 + 2}s`,
-              }}
-            />
-          ))}
+          {isHydrated && [...Array(150)].map((_, i) => {
+            // Use index-based seeded randomization to ensure consistent positioning
+            const seed = i * 12345;
+            const random1 = ((seed * 9301 + 49297) % 233280) / 233280;
+            const random2 = (((seed + 1) * 9301 + 49297) % 233280) / 233280;
+            const random3 = (((seed + 2) * 9301 + 49297) % 233280) / 233280;
+            const random4 = (((seed + 3) * 9301 + 49297) % 233280) / 233280;
+            const random5 = (((seed + 4) * 9301 + 49297) % 233280) / 233280;
+            
+            return (
+              <div
+                key={i}
+                className="absolute bg-white rounded-full animate-pulse"
+                style={{
+                  left: `${random1 * 100}%`,
+                  top: `${random2 * 100}%`,
+                  width: `${random3 * 3 + 1}px`,
+                  height: `${random3 * 3 + 1}px`,
+                  animationDelay: `${random4 * 3}s`,
+                  animationDuration: `${random5 * 3 + 2}s`,
+                }}
+              />
+            );
+          })}
         </div>
         {/* Subtle cosmic glow */}
         <div className="absolute inset-0 bg-gradient-radial from-blue-900/20 via-transparent to-transparent"></div>
@@ -311,7 +469,7 @@ export default function Home() {
 
         <div className="w-full max-w-5xl mx-auto">
           {/* Enhanced Controls */}
-          <div className="mb-12 flex justify-center">
+          <div className="mb-12 flex justify-center gap-4">
             <button
               className="group relative px-10 py-4 bg-white text-black rounded-full shadow-2xl hover:shadow-blue-500/25 transition-all duration-300 disabled:opacity-50 text-lg font-bold tracking-wide overflow-hidden focus:outline-none focus:ring-4 focus:ring-blue-400/50"
               onClick={handleFetchClick}
@@ -329,6 +487,18 @@ export default function Home() {
                 )}
               </span>
             </button>
+            
+            {isHydrated && (diffs.length > 0 || Object.keys(generatedNotes).length > 0) && (
+              <button
+                className="group relative px-6 py-4 bg-transparent border border-red-400/40 text-red-200 rounded-full hover:bg-red-500/20 hover:border-red-400/60 transition-all duration-300 font-medium shadow-lg backdrop-blur-sm focus:outline-none focus:ring-2 focus:ring-red-400/50"
+                onClick={clearStoredData}
+                title="Clear all stored data and start fresh"
+              >
+                <span className="flex items-center gap-2">
+                  🗑️ Clear All Data
+                </span>
+              </button>
+            )}
           </div>
 
           {/* Enhanced Results Container */}
@@ -405,6 +575,20 @@ export default function Home() {
                                 {expandedPRs[pr.id] ? "Hide Notes 📖" : "Show Notes 📖"}
                               </button>
                             )}
+                            
+                            {interruptedStreams[pr.id] && (
+                              <button 
+                                onClick={() => resumeGeneration(pr)}
+                                className="group/btn relative px-6 py-3 bg-orange-500/80 text-white rounded-full shadow-xl hover:bg-orange-500 transition-all duration-300 disabled:opacity-50 font-bold overflow-hidden focus:outline-none focus:ring-2 focus:ring-orange-400/50"
+                                disabled={loadingPR === pr.id}
+                              >
+                                <div className="absolute inset-0 bg-gradient-to-r from-orange-400 to-orange-600 opacity-0 group-hover/btn:opacity-100 transition-opacity duration-300"></div>
+                                <span className="relative">
+                                  🔄 Resume
+                                </span>
+                              </button>
+                            )}
+                            
                             <button 
                               onClick={() => generateNotes(pr)}
                               className="group/btn relative px-8 py-3 bg-white text-black rounded-full shadow-xl hover:shadow-blue-500/25 transition-all duration-300 disabled:opacity-50 font-bold overflow-hidden focus:outline-none focus:ring-2 focus:ring-blue-400/50"
@@ -418,15 +602,23 @@ export default function Home() {
                                     Generating...
                                   </>
                                 ) : (
-                                  "🤖 Generate Notes"
+                                  interruptedStreams[pr.id] ? "🔄 Restart" : "🤖 Generate Notes"
                                 )}
                               </span>
                             </button>
                           </div>
                         </div>
 
-                        {(loadingPR === pr.id || (generatedNotes[pr.id] && expandedPRs[pr.id])) && (
+                        {(loadingPR === pr.id || (generatedNotes[pr.id] && expandedPRs[pr.id]) || interruptedStreams[pr.id]) && (
                           <div className="mt-8 p-8 bg-slate-900/60 backdrop-blur-sm rounded-2xl border border-blue-500/20 shadow-inner">
+                            {interruptedStreams[pr.id] && (
+                              <div className="mb-4 p-4 bg-orange-900/40 border border-orange-500/30 rounded-xl">
+                                <div className="flex items-center gap-2 text-orange-300">
+                                  <span className="text-xl">⚠️</span>
+                                  <span className="font-medium">{interruptedStreams[pr.id]}</span>
+                                </div>
+                              </div>
+                            )}
                             <div className="prose dark:prose-invert max-w-none prose-headings:text-blue-200 prose-headings:font-bold prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg prose-p:text-blue-100/90 prose-p:leading-relaxed prose-ul:pl-6 prose-li:text-blue-100/90 prose-strong:text-white prose-code:text-blue-300 prose-code:bg-blue-900/30 prose-code:px-2 prose-code:py-1 prose-code:rounded">
                               <ReactMarkdown
                                 components={{
