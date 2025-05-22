@@ -13,7 +13,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Diff Digest",
+  title: "Tejas Chakrapani - Diff Digest",
   description: "a0 Take Home - Diff Digest",
 };
 
