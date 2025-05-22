@@ -456,14 +456,14 @@ export default function Home() {
         <div className="text-center mb-16">
           <h1 className="text-7xl md:text-8xl font-black mb-4 tracking-tight">
             <span className="bg-gradient-to-b from-white via-blue-100 to-blue-300 bg-clip-text text-transparent drop-shadow-2xl">
-              hire me plz
+              Tejas Chakrapani 
             </span>
           </h1>
           <div className="text-4xl md:text-5xl mb-6">
             <span className="text-blue-300/80 font-light">✨</span>
           </div>
           <p className="text-xl md:text-2xl text-blue-100/80 font-light max-w-2xl mx-auto leading-relaxed">
-            Tejas Chakrapani's a0.dev submission
+            a very cool a0.dev submission for an internship
           </p>
         </div>
 
